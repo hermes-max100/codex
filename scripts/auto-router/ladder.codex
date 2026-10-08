@@ -1,6 +1,0 @@
-# model  effort   ("-" = model from ~/.codex/config.toml). Cheapest first.
-# Add a cheaper model at the top if your account has one, e.g. "<mini-model> low".
--  low
--  medium
--  high
--  xhigh

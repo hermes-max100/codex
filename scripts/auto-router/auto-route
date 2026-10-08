@@ -15,7 +15,11 @@ runs --check; it only escalates to the next rung if the check fails, the agent
 errors, or the agent says ROUTER_ESCALATE.
 
 Options:
-  --engine claude|codex   CLI to drive (default: claude)
+  --engine ENGINE         claude      Claude Code CLI (default)
+                          chatgpt     Codex CLI signed in with a ChatGPT plan
+                                      ("codex" is an alias)
+                          muse        Codex CLI pointed at Meta Model API
+                                      (Muse Spark); needs MODEL_API_KEY
   --check CMD             Verification command; exit 0 = pass (e.g. "npm test").
                           Strongly recommended: without it the only escalation
                           signal is the agent's own self-report.
@@ -89,9 +93,11 @@ if [ "$stats" = 1 ]; then
 fi
 
 case "$engine" in
-  claude|codex) ;;
-  *) echo "auto-route: --engine must be claude or codex" >&2; exit 2 ;;
+  claude|chatgpt|muse) ;;
+  codex) engine=chatgpt ;;
+  *) echo "auto-route: --engine must be claude, chatgpt, or muse" >&2; exit 2 ;;
 esac
+cli=$([ "$engine" = claude ] && echo claude || echo codex)
 [ -n "$task" ] || { usage >&2; exit 2; }
 for value in "$start" "$max_rung"; do
   case "$value" in
@@ -103,7 +109,11 @@ if [ -n "$budget" ] && ! printf '%s' "$budget" | grep -Eq '^[0-9]+([.][0-9]+)?$'
   exit 2
 fi
 command -v jq >/dev/null || { echo "auto-route: jq is required" >&2; exit 2; }
-command -v "$engine" >/dev/null || { echo "auto-route: $engine not on PATH" >&2; exit 2; }
+command -v "$cli" >/dev/null || { echo "auto-route: $cli not on PATH" >&2; exit 2; }
+if [ "$engine" = muse ] && [ -z "${MODEL_API_KEY:-}" ]; then
+  echo "auto-route: --engine muse needs MODEL_API_KEY (create one in the Meta Model API dashboard)" >&2
+  exit 2
+fi
 ladder_file=${ladder_file:-$script_dir/ladder.$engine}
 [ -f "$ladder_file" ] || { echo "auto-route: ladder file $ladder_file not found" >&2; exit 2; }
 
@@ -123,8 +133,8 @@ fi
 if [ -z "$check" ]; then
   echo "auto-route: warning: no --check; escalation relies on agent self-report only" >&2
 fi
-if [ -n "$budget" ] && [ "$engine" = codex ]; then
-  echo "auto-route: warning: --budget-usd is not enforced for codex (tokens are logged)" >&2
+if [ -n "$budget" ] && [ "$cli" = codex ]; then
+  echo "auto-route: warning: --budget-usd is not enforced for $engine (tokens are logged)" >&2
 fi
 
 mkdir -p "$(dirname "$log")"
@@ -173,6 +183,14 @@ while [ "$rung" -le "$rungs" ]; do
     fi
   else
     args=(exec --json -o "$work/last.txt")
+    if [ "$engine" = muse ]; then
+      # Meta Model API speaks the OpenAI Responses API; key comes from MODEL_API_KEY.
+      args+=(-c 'model_providers.meta.name="Meta Model API"'
+        -c 'model_providers.meta.base_url="https://api.meta.ai/v1"'
+        -c 'model_providers.meta.env_key="MODEL_API_KEY"'
+        -c 'model_providers.meta.wire_api="responses"'
+        -c 'model_provider="meta"')
+    fi
     [ "$model" != - ] && args+=(-m "$model")
     [ "$effort" != - ] && args+=(-c "model_reasoning_effort=\"$effort\"")
     : > "$work/last.txt"

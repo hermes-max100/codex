@@ -1,0 +1,15 @@
+# Copy to ~/.codex/muse.config.toml and run `codex --profile muse` (needs MODEL_API_KEY).
+# A profile file replaces config.toml for that run, so it must be complete on its own.
+model_provider = "meta"
+model = "muse-spark-1.3"
+model_reasoning_effort = "medium"
+
+[model_providers.meta]
+name = "Meta Model API"
+base_url = "https://api.meta.ai/v1"
+env_key = "MODEL_API_KEY"
+wire_api = "responses"
+
+[agents]
+default_subagent_model = "muse-spark-1.3"
+default_subagent_reasoning_effort = "low"

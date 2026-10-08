@@ -5,9 +5,20 @@ one rung at a time only when it has to.
 
 ```
 auto-route --check "npm test" "fix the failing date parser test"
-auto-route --engine codex --check "cargo test -p mycrate" "add retry to the client"
+auto-route --engine chatgpt --check "cargo test -p mycrate" "add retry to the client"
+MODEL_API_KEY=... auto-route --engine muse --check "pytest" "handle empty input"
 auto-route --stats
 ```
+
+| Engine | Drives | Default ladder (cheapest first) |
+| --- | --- | --- |
+| `claude` | Claude Code CLI | haiku -> sonnet/medium -> opus/high -> fable/high -> fable/max |
+| `chatgpt` (alias `codex`) | Codex CLI on a ChatGPT plan | gpt-5.6-luna low/medium -> terra medium/high -> sol high/xhigh |
+| `muse` | Codex CLI pointed at Meta Model API | muse-spark-1.3 low -> medium -> high |
+
+The `muse` engine uses the Codex CLI because Meta Model API accepts the OpenAI Responses
+API. The router passes the provider settings with `-c` and reads the key from
+`MODEL_API_KEY`.
 
 ## How it decides to escalate
 
@@ -28,7 +39,8 @@ build pass, so a cheaper model's output is never accepted unverified. Without
 
 ## Ladders
 
-`ladder.claude` and `ladder.codex` list one `model effort` per line, cheapest first.
+`ladder.claude`, `ladder.chatgpt`, and `ladder.muse` list one `model effort` per line,
+cheapest first.
 `-` means the CLI default. Edit them, or pass `--ladder FILE`.
 
 ## Controlling spend
@@ -44,24 +56,22 @@ Escalation has a cost: a task that ends on rung 3 also paid for rungs 1 and 2. T
 cheaper overall only if most tasks pass low on the ladder. Check `--stats`, and raise
 `--start` for task types that keep climbing.
 
-## In-session routing (subagents)
+## In-session kits
 
-The script routes whole tasks. For subagents dispatched inside an interactive
-session, add this to `CLAUDE.md` (Claude Code) or `AGENTS.md` (Codex):
+The script routes whole tasks run from the shell. The kits route the work inside
+interactive sessions, where subagents get dispatched:
 
-```markdown
-## Model routing
-- Do small or context-heavy work directly. Dispatch a subagent only for broad
-  searches, independent parallel work, or long tasks that would bloat context.
-- Pick the subagent model by difficulty, starting at the lowest tier that fits:
-  haiku/low for lookups and mechanical edits; sonnet/medium for standard
-  implementation and tests; opus/high for multi-file or subtle changes; the top
-  model only for architecture, security, or after a lower tier failed.
-- Escalate one tier only on evidence: failing tests or checks, or a result that
-  doesn't hold up on review. Never accept a subagent result unverified.
-```
+- `kits/claude/`: put `CLAUDE.md.snippet` in `CLAUDE.md`, and copy `agents/*.md` to
+  `.claude/agents/`. You get `scout` (haiku, read-only), `builder` (sonnet), and
+  `architect` (opus). The main session decides which one gets each job.
+- `kits/chatgpt/`: put `AGENTS.md.snippet` in `AGENTS.md` and `config.toml.snippet` in
+  `~/.codex/config.toml`. Subagents default to Luna at low effort. Copy
+  `deep.config.toml` to `~/.codex/` and use `codex --profile deep` for hard sessions.
+  `chatgpt-app.md` covers the chat app: picker settings and custom instructions.
+- `kits/muse/`: copy `muse.config.toml` to `~/.codex/` and run `codex --profile muse`.
+  Put `MUSE.md.snippet` in your Muse instructions or `AGENTS.md`.
 
 ## Tests
 
-`./test.sh` exercises the ladder walk, self-escalation, budget stop, rung cap, the
-codex engine, and stats against stub CLIs. It spends no credits.
+`./test.sh` runs against stub CLIs and spends no credits. It covers the ladder walk,
+self-escalation, budget stops, rung caps, all three engines, input validation, and stats.

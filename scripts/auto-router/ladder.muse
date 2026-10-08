@@ -1,0 +1,5 @@
+# model            effort   Meta Model API (Muse Spark). One model family, so the
+# ladder climbs reasoning effort; higher effort = more reasoning tokens billed as output.
+muse-spark-1.3     low
+muse-spark-1.3     medium
+muse-spark-1.3     high

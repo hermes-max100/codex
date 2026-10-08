@@ -28,19 +28,25 @@ jq -nc --arg r "$result" '{type: "result", is_error: false, result: $r,
   total_cost_usd: 0.1, usage: {input_tokens: 100, output_tokens: 10}}'
 EOF
 
-# Stub codex: records its reasoning effort and emits one completed turn.
+# Stub codex: records "model effort provider" and emits one completed turn.
 cat > "$tmp/bin/codex" <<'EOF'
 #!/usr/bin/env bash
-last="" effort=default
+last="" model=default effort=default provider=default
 while [ $# -gt 1 ]; do
   case "$1" in
     -o) last=$2; shift 2 ;;
-    -c) effort=${2#model_reasoning_effort=}; effort=${effort//\"/}; shift 2 ;;
+    -m) model=$2; shift 2 ;;
+    -c)
+      case "$2" in
+        model_reasoning_effort=*) effort=${2#*=}; effort=${effort//\"/} ;;
+        model_provider=*) provider=${2#*=}; provider=${provider//\"/} ;;
+      esac
+      shift 2 ;;
     *) shift ;;
   esac
 done
-echo "$effort" > "$STUB_WORK/last_model"
-echo "done at $effort" > "$last"
+echo "$model $effort $provider" > "$STUB_WORK/last_model"
+echo "done at $model $effort" > "$last"
 echo '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}'
 EOF
 chmod +x "$tmp/bin/claude" "$tmp/bin/codex"
@@ -83,12 +89,22 @@ set -e
 [ "$code" = 1 ] || fail "max-rung exit code: $code"
 [ "$(jq -s 'map(.model)' -c "$log")" = '["haiku","sonnet"]' ] || fail "max-rung models"
 
-# 6. Codex engine escalates reasoning effort and logs tokens.
+# 6. ChatGPT engine (codex alias) climbs Luna -> Terra on the default ladder and logs tokens.
 log="$tmp/log6.jsonl"
-out=$("$router" --engine codex --log "$log" --check "grep -qx high $tmp/last_model" "task" 2>/dev/null)
-[ "$out" = "done at high" ] || fail "codex result: $out"
-got=$(jq -sc 'map([.effort, .tokens])' "$log")
-[ "$got" = '[["low",55],["medium",55],["high",55]]' ] || fail "codex walk: $got"
+out=$("$router" --engine codex --log "$log" --check "grep -q '^gpt-5.6-terra high' $tmp/last_model" "task" 2>/dev/null)
+[ "$out" = "done at gpt-5.6-terra high" ] || fail "chatgpt result: $out"
+got=$(jq -sc 'map([.engine, .model, .effort, .tokens])' "$log")
+[ "$got" = '[["chatgpt","gpt-5.6-luna","low",55],["chatgpt","gpt-5.6-luna","medium",55],["chatgpt","gpt-5.6-terra","medium",55],["chatgpt","gpt-5.6-terra","high",55]]' ] \
+  || fail "chatgpt walk: $got"
+
+# 6b. Muse engine requires MODEL_API_KEY and routes through the meta provider.
+set +e
+env -u MODEL_API_KEY "$router" --engine muse --log "$tmp/log6b.jsonl" "t" >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" = 2 ] || fail "muse without key should exit 2, got $code"
+out=$(MODEL_API_KEY=k "$router" --engine muse --log "$tmp/log6b.jsonl" --check "grep -qx 'muse-spark-1.3 medium meta' $tmp/last_model" "t" 2>/dev/null)
+[ "$out" = "done at muse-spark-1.3 medium" ] || fail "muse result: $out"
 
 # 7. Stats summarize which rung runs needed.
 "$router" --stats --log "$tmp/log1.jsonl" | grep -q "rung 3: 1 runs" || fail "stats"

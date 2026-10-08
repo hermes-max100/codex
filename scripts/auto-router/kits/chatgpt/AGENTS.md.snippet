@@ -1,0 +1,10 @@
+## Model routing
+- Do small or context-heavy work directly. Use spawn_agent only for broad searches,
+  independent parallel work, or long tasks that would bloat context.
+- Subagents default to gpt-5.6-luna at low effort (see config.toml [agents]). Pass a
+  stronger model or effort to spawn_agent only when the task needs it:
+  - gpt-5.6-luna low/medium: lookups, mechanical edits, simple tests
+  - gpt-5.6-terra medium/high: standard implementation and refactors
+  - gpt-5.6-sol high/xhigh: architecture, subtle bugs, security, or after a lower tier failed
+- Escalate one step only on evidence: failing tests or checks, or a result that does not
+  hold up on review. Never report a subagent's result as done without verifying it.
