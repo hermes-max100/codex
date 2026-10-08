@@ -12,10 +12,12 @@ mkdir -p "$tmp/bin"
 cat > "$tmp/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 model=default
+echo "$*" > "$STUB_WORK/last_args"
 while [ $# -gt 1 ]; do
   case "$1" in --model) model=$2; shift 2 ;; *) shift ;; esac
 done
 echo "$model" > "$STUB_WORK/last_model"
+printf '%s\n<<END>>\n' "$1" >> "$STUB_WORK/prompts"
 cat > "$STUB_WORK/stdin_seen"
 [ -n "${STUB_BAD_JSON:-}" ] && { echo '{"truncated'; exit 1; }
 case " ${STUB_ESCALATE_MODELS:-} " in
@@ -32,6 +34,7 @@ EOF
 cat > "$tmp/bin/codex" <<'EOF'
 #!/usr/bin/env bash
 last="" model=default effort=default provider=default
+echo "$*" > "$STUB_WORK/last_args"
 while [ $# -gt 1 ]; do
   case "$1" in
     -o) last=$2; shift 2 ;;
@@ -173,5 +176,25 @@ log="$tmp/private/log16.jsonl"
 "$router" --engine chatgpt --max-rung 1 --log "$log" "t" >/dev/null 2>&1 || true
 [ "$(jq -s '.[0].tokens' "$log")" = null ] || fail "failed codex turn should log null tokens"
 [ "$(stat -c %a "$log" 2>/dev/null || stat -f %Lp "$log")" = 600 ] || fail "log should be mode 600"
+
+# 17. Prompts: rung 1 carries the escalation contract; rung 2 gets the failure reason and
+# the bounded, UTF-8-clean tail of the check output.
+: > "$tmp/prompts"
+log="$tmp/log17.jsonl"
+check="python3 -c 'import sys; sys.stdout.write(\"\\u00e9\" * 2001 + \"\\n\"); sys.exit(1)'"
+"$router" --log "$log" --max-rung 2 --check "$check" "fix it" >/dev/null 2>&1 || true
+first=$(awk '/^<<END>>$/{exit} {print}' "$tmp/prompts")
+second=$(awk 'f{print} /^<<END>>$/{f=1}' "$tmp/prompts" | sed '/^<<END>>$/d')
+grep -q 'ROUTER_ESCALATE: <short reason>' <<< "$first" || fail "rung 1 prompt lacks the contract"
+grep -q 'did not pass (check failed' <<< "$second" || fail "rung 2 prompt lacks the failure reason"
+tail_bytes=$(printf '%s' "$second" | sed -n '/^Tail of the check output/,$p' | tail -n +2 | wc -c)
+[ "$tail_bytes" -le 4001 ] || fail "check tail not capped: $tail_bytes bytes"
+printf '%s' "$second" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || fail "rung 2 prompt is not valid UTF-8"
+
+# 18. Headless permission defaults, overridable by the caller.
+"$router" --log "$tmp/log18.jsonl" --check true "t" >/dev/null 2>&1
+grep -q -- '--permission-mode acceptEdits' "$tmp/last_args" || fail "claude default permission mode"
+"$router" --log "$tmp/log18.jsonl" --check true "t" -- --permission-mode auto >/dev/null 2>&1
+[ "$(grep -o -- '--permission-mode' "$tmp/last_args" | wc -l)" = 1 ] || fail "caller permission mode should win"
 
 echo "all auto-route tests passed"

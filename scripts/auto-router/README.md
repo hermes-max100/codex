@@ -20,6 +20,11 @@ The `muse` engine uses the Codex CLI because Meta Model API accepts the OpenAI R
 API. The router passes the provider settings with `-c` and reads the key from
 `MODEL_API_KEY`.
 
+Runs are headless, so the router gives the agent permission to edit files and nothing
+more: `--permission-mode acceptEdits` for Claude, `-s workspace-write` for Codex. The
+router runs `--check` itself. To allow more, pass your own mode after `--`, for example
+`-- --permission-mode auto`. Your setting replaces the default.
+
 ## How it decides to escalate
 
 The router moves up one rung on the ladder when one of these happens:

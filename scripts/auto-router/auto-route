@@ -120,14 +120,29 @@ if [ "$engine" = muse ] && [ -z "${MODEL_API_KEY:-}" ]; then
   echo "auto-route: --engine muse needs MODEL_API_KEY (create one in the Meta Model API dashboard)" >&2
   exit 2
 fi
-if [ "$cli" = codex ]; then
-  for arg in ${extra[@]+"${extra[@]}"}; do
-    case "$arg" in
-      -C|-C*|--cd|--cd=*)
+# Headless runs cannot answer permission prompts, so default to a mode that may edit
+# files in the working tree. --check runs the tests, so the agent needs no shell access.
+# An explicit permission or sandbox flag in the extra args wins.
+permission_args=()
+caller_set_permissions=0
+for arg in ${extra[@]+"${extra[@]}"}; do
+  case "$arg" in
+    -C|-C*|--cd|--cd=*)
+      if [ "$cli" = codex ]; then
         echo "auto-route: don't pass $arg; cd into the directory first so --check runs where the agent edits" >&2
-        exit 2 ;;
-    esac
-  done
+        exit 2
+      fi ;;
+    --permission-mode|--permission-mode=*|--dangerously-skip-permissions|\
+    -s|--sandbox|--sandbox=*|--full-auto|--dangerously-bypass-approvals-and-sandbox)
+      caller_set_permissions=1 ;;
+  esac
+done
+if [ "$caller_set_permissions" = 0 ]; then
+  if [ "$cli" = claude ]; then
+    permission_args=(--permission-mode acceptEdits)
+  else
+    permission_args=(-s workspace-write)
+  fi
 fi
 ladder_file=${ladder_file:-$script_dir/ladder.$engine}
 [ -f "$ladder_file" ] || { echo "auto-route: ladder file $ladder_file not found" >&2; exit 2; }
@@ -160,7 +175,8 @@ fi
 (umask 077 && mkdir -p "$(dirname "$log")" && touch "$log")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-run_id="$(date +%s)-$$"
+# Random suffix: separate hosts or containers can share a timestamp and PID.
+run_id="$(date +%s)-$$-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 spent=0
 feedback=""
 
@@ -170,6 +186,16 @@ Router contract: you are one rung of an escalation ladder. If you cannot complet
 this task correctly at your capability level, stop and print one line exactly:
 ROUTER_ESCALATE: <short reason>
 Do not guess or produce a partial fix to avoid escalating.'
+
+# Byte truncation can split a multibyte character, and Codex rejects a prompt that is
+# not valid UTF-8, so drop invalid sequences. Without iconv, fall back to ASCII.
+utf8_clean() {
+  if command -v iconv >/dev/null; then
+    iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true
+  else
+    LC_ALL=C tr -cd '\11\12\15\40-\176'
+  fi
+}
 
 rung=$start
 while [ "$rung" -le "$rungs" ]; do
@@ -191,7 +217,7 @@ while [ "$rung" -le "$rungs" ]; do
       remaining=$(jq -n "$budget - $spent")
       args+=(--max-budget-usd "$remaining")
     fi
-    claude "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/out.json" || agent_ok=0
+    claude "${args[@]}" ${permission_args[@]+"${permission_args[@]}"} ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/out.json" || agent_ok=0
     if jq -e . "$work/out.json" >/dev/null 2>&1; then
       message=$(jq -r '.result // ""' "$work/out.json")
       cost=$(jq -r '.total_cost_usd // 0' "$work/out.json")
@@ -215,7 +241,7 @@ while [ "$rung" -le "$rungs" ]; do
     [ "$model" != - ] && args+=(-m "$model")
     [ "$effort" != - ] && args+=(-c "model_reasoning_effort=\"$effort\"")
     : > "$work/last.txt"
-    codex "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
+    codex "${args[@]}" ${permission_args[@]+"${permission_args[@]}"} ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
     message=$(cat "$work/last.txt")
     # A failed turn reports no usage, so record it as unknown (null) rather than 0.
     tokens=$(jq -s '[.[] | select(.type == "turn.completed") | .usage | (.input_tokens // 0) + (.output_tokens // 0)] | if length == 0 then null else add end' "$work/events.jsonl" 2>/dev/null || echo null)
@@ -229,7 +255,12 @@ while [ "$rung" -le "$rungs" ]; do
   elif grep -q '^ROUTER_ESCALATE:' <<< "$message"; then
     reason=$(grep -m1 '^ROUTER_ESCALATE:' <<< "$message")
   elif [ -n "$check" ]; then
-    if ! bash -c "$check" > "$work/check.txt" 2>&1; then
+    # Keep only a bounded tail while streaming, so a noisy check can't fill the disk.
+    set +e
+    bash -c "$check" < /dev/null 2>&1 | tail -c 65536 > "$work/check.txt"
+    check_status=${PIPESTATUS[0]}
+    set -e
+    if [ "$check_status" != 0 ]; then
       reason="check failed: $check"
     fi
   fi
@@ -272,7 +303,7 @@ Its edits are still in the working tree; review them critically rather than trus
   if [ -f "$work/check.txt" ] && [ -s "$work/check.txt" ]; then
     feedback="$feedback
 Tail of the check output (last 60 lines, capped at 4000 bytes):
-$(tail -n 60 "$work/check.txt" | tail -c 4000)"
+$(tail -n 60 "$work/check.txt" | tail -c 4000 | utf8_clean)"
   fi
   rm -f "$work/check.txt"
   rung=$((rung + 1))
