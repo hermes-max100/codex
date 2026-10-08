@@ -42,7 +42,17 @@ stats=0
 task=""
 extra=()
 
+need_value() {
+  if [ "$2" -lt 2 ]; then
+    echo "auto-route: $1 requires a value" >&2
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
+  case "$1" in
+    --engine|--check|--start|--max-rung|--budget-usd|--ladder|--log) need_value "$1" $# ;;
+  esac
   case "$1" in
     --engine) engine=$2; shift 2 ;;
     --check) check=$2; shift 2 ;;
@@ -63,13 +73,17 @@ if [ "$stats" = 1 ]; then
   [ -f "$log" ] || { echo "auto-route: no log at $log" >&2; exit 1; }
   jq -s -r '
     group_by(.run_id)
-    | map({passed: any(.[]; .passed), final: (map(.rung) | max),
-           cost: (map(.cost_usd) | add), tokens: (map(.tokens) | add)}) as $runs
-    | "runs: \($runs | length)  passed: \($runs | map(select(.passed)) | length)",
-      "total cost_usd: \($runs | map(.cost) | add)  total tokens: \($runs | map(.tokens) | add)",
-      "final rung needed (passed runs):",
+    | map({ladder: "\(.[0].engine) \(.[0].ladder // "default")",
+           passed: any(.[]; .passed), final: (map(.rung) | max),
+           cost: (map(.cost_usd) | add), tokens: (map(.tokens) | add)})
+    | group_by(.ladder)[]
+    | . as $runs
+    | "[\($runs[0].ladder)]",
+      "  runs: \($runs | length)  passed: \($runs | map(select(.passed)) | length)",
+      "  total cost_usd: \($runs | map(.cost) | add)  total tokens: \($runs | map(.tokens) | add)",
+      "  final rung needed (passed runs):",
       ($runs | map(select(.passed)) | group_by(.final)[]
-        | "  rung \(.[0].final): \(length) runs")
+        | "    rung \(.[0].final): \(length) runs")
   ' "$log"
   exit 0
 fi
@@ -79,6 +93,15 @@ case "$engine" in
   *) echo "auto-route: --engine must be claude or codex" >&2; exit 2 ;;
 esac
 [ -n "$task" ] || { usage >&2; exit 2; }
+for value in "$start" "$max_rung"; do
+  case "$value" in
+    ''|*[!0-9]*) echo "auto-route: --start/--max-rung must be non-negative integers" >&2; exit 2 ;;
+  esac
+done
+if [ -n "$budget" ] && ! printf '%s' "$budget" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+  echo "auto-route: --budget-usd must be a number" >&2
+  exit 2
+fi
 command -v jq >/dev/null || { echo "auto-route: jq is required" >&2; exit 2; }
 command -v "$engine" >/dev/null || { echo "auto-route: $engine not on PATH" >&2; exit 2; }
 ladder_file=${ladder_file:-$script_dir/ladder.$engine}
@@ -86,7 +109,7 @@ ladder_file=${ladder_file:-$script_dir/ladder.$engine}
 
 models=()
 efforts=()
-while read -r model effort _; do
+while read -r model effort _ || [ -n "$model" ]; do
   case "$model" in ''|'#'*) continue ;; esac
   models+=("$model")
   efforts+=("${effort:--}")
@@ -126,6 +149,7 @@ while [ "$rung" -le "$rungs" ]; do
   echo "auto-route: rung $rung/$rungs model=$model effort=$effort" >&2
 
   agent_ok=1
+  cost_known=1
   cost=0
   tokens=0
   message=""
@@ -137,7 +161,7 @@ while [ "$rung" -le "$rungs" ]; do
       remaining=$(jq -n "$budget - $spent")
       args+=(--max-budget-usd "$remaining")
     fi
-    claude "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" > "$work/out.json" || agent_ok=0
+    claude "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/out.json" || agent_ok=0
     if jq -e . "$work/out.json" >/dev/null 2>&1; then
       message=$(jq -r '.result // ""' "$work/out.json")
       cost=$(jq -r '.total_cost_usd // 0' "$work/out.json")
@@ -145,13 +169,14 @@ while [ "$rung" -le "$rungs" ]; do
       [ "$(jq -r '.is_error // false' "$work/out.json")" = true ] && agent_ok=0
     else
       agent_ok=0
+      cost_known=0
     fi
   else
     args=(exec --json -o "$work/last.txt")
     [ "$model" != - ] && args+=(-m "$model")
     [ "$effort" != - ] && args+=(-c "model_reasoning_effort=\"$effort\"")
     : > "$work/last.txt"
-    codex "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" > "$work/events.jsonl" || agent_ok=0
+    codex "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
     message=$(cat "$work/last.txt")
     tokens=$(jq -s '[.[] | select(.type == "turn.completed") | .usage | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' "$work/events.jsonl" 2>/dev/null || echo 0)
     grep -q '"type":"turn.failed"' "$work/events.jsonl" && agent_ok=0
@@ -161,8 +186,8 @@ while [ "$rung" -le "$rungs" ]; do
   reason=""
   if [ "$agent_ok" = 0 ]; then
     reason="agent run failed"
-  elif printf '%s\n' "$message" | grep -q '^ROUTER_ESCALATE:'; then
-    reason=$(printf '%s\n' "$message" | grep -m1 '^ROUTER_ESCALATE:')
+  elif grep -q '^ROUTER_ESCALATE:' <<< "$message"; then
+    reason=$(grep -m1 '^ROUTER_ESCALATE:' <<< "$message")
   elif [ -n "$check" ]; then
     if ! bash -c "$check" > "$work/check.txt" 2>&1; then
       reason="check failed: $check"
@@ -170,13 +195,16 @@ while [ "$rung" -le "$rungs" ]; do
   fi
 
   passed=$([ -z "$reason" ] && echo true || echo false)
-  jq -nc --arg run_id "$run_id" --arg engine "$engine" --argjson rung "$rung" \
-    --arg model "$model" --arg effort "$effort" --argjson passed "$passed" \
-    --arg reason "$reason" --argjson cost_usd "$cost" --argjson tokens "$tokens" \
-    --arg task "${task:0:200}" \
-    '{run_id: $run_id, ts: (now | floor), engine: $engine, rung: $rung, model: $model,
-      effort: $effort, passed: $passed, reason: $reason, cost_usd: $cost_usd,
-      tokens: $tokens, task: $task}' >> "$log"
+  # Fields are truncated so each record stays small, and the record is appended
+  # with a single write so concurrent routers sharing the log don't interleave.
+  record=$(jq -nc --arg run_id "$run_id" --arg engine "$engine" --argjson rung "$rung" \
+    --arg ladder "$ladder_file" --arg model "$model" --arg effort "$effort" \
+    --argjson passed "$passed" --arg reason "${reason:0:300}" --argjson cost_usd "$cost" \
+    --argjson tokens "$tokens" --arg task "${task:0:200}" \
+    '{run_id: $run_id, ts: (now | floor), engine: $engine, ladder: $ladder, rung: $rung,
+      model: $model, effort: $effort, passed: $passed, reason: $reason,
+      cost_usd: $cost_usd, tokens: $tokens, task: $task}')
+  printf '%s\n' "$record" >> "$log"
 
   if [ "$passed" = true ]; then
     printf '%s\n' "$message"
@@ -185,6 +213,10 @@ while [ "$rung" -le "$rungs" ]; do
   fi
   echo "auto-route: rung $rung did not pass: $reason" >&2
 
+  if [ -n "$budget" ] && [ "$cost_known" = 0 ]; then
+    echo "auto-route: rung $rung's cost is unknown; stopping to protect the \$$budget budget" >&2
+    exit 3
+  fi
   if [ -n "$budget" ] && [ "$(jq -n "$spent >= $budget")" = true ]; then
     echo "auto-route: budget \$$budget exhausted (spent \$$spent)" >&2
     exit 3
@@ -198,8 +230,8 @@ A smaller model already attempted this and did not pass ($reason).
 Its edits are still in the working tree; review them critically rather than trusting them."
   if [ -f "$work/check.txt" ] && [ -s "$work/check.txt" ]; then
     feedback="$feedback
-Last 60 lines of the check output:
-$(tail -n 60 "$work/check.txt")"
+Tail of the check output (last 60 lines, capped at 4000 bytes):
+$(tail -n 60 "$work/check.txt" | tail -c 4000)"
   fi
   rm -f "$work/check.txt"
   rung=$((rung + 1))
