@@ -1,5 +1,5 @@
 # Copy to ~/.codex/deep.config.toml and run `codex --profile deep` for hard sessions.
-# A profile file replaces config.toml for that run, so it must be complete on its own.
+# Codex layers a profile on top of ~/.codex/config.toml, so list only what changes.
 model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 

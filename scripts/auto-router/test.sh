@@ -147,4 +147,31 @@ echo "next task" | "$router" --log "$tmp/log12.jsonl" --check true "t" >/dev/nul
 cat "$tmp/log1.jsonl" "$tmp/log6.jsonl" > "$tmp/mixed.jsonl"
 [ "$("$router" --stats --log "$tmp/mixed.jsonl" | grep -c '^\[')" = 2 ] || fail "stats per engine"
 
+# 14. A second positional task and a Codex working-directory change are usage errors.
+for bad in "one two" "--engine chatgpt t -- -C /tmp" "--engine chatgpt t -- --cd=/tmp"; do
+  set +e
+  # shellcheck disable=SC2086
+  "$router" --log "$tmp/log14.jsonl" $bad >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" = 2 ] || fail "'$bad' should exit 2, got $code"
+done
+
+# 15. CRLF ladder rows work; blank CRLF lines are not rungs.
+printf 'haiku -\r\n\r\nopus high\r\n' > "$tmp/crlf"
+log="$tmp/log15.jsonl"
+"$router" --ladder "$tmp/crlf" --log "$log" --check "grep -qx opus $tmp/last_model" "t" >/dev/null 2>&1 \
+  || fail "CRLF ladder"
+[ "$(jq -sc 'map([.model, .effort])' "$log")" = '[["haiku","-"],["opus","high"]]' ] || fail "CRLF rungs"
+
+# 16. Failed Codex turns log unknown usage, and the log is owner-only.
+cat > "$tmp/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo '{"type":"turn.failed","error":{"message":"boom"}}'
+EOF
+log="$tmp/private/log16.jsonl"
+"$router" --engine chatgpt --max-rung 1 --log "$log" "t" >/dev/null 2>&1 || true
+[ "$(jq -s '.[0].tokens' "$log")" = null ] || fail "failed codex turn should log null tokens"
+[ "$(stat -c %a "$log" 2>/dev/null || stat -f %Lp "$log")" = 600 ] || fail "log should be mode 600"
+
 echo "all auto-route tests passed"

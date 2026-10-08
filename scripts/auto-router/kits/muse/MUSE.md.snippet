@@ -1,7 +1,9 @@
 ## Model routing (Muse Spark)
 Muse Spark is one model family; cost is controlled by reasoning effort. Reasoning tokens
 are billed as output, so effort is the main lever.
-- Default to low effort for lookups, mechanical edits, and delegated subagent work.
+- Default to low effort for lookups and mechanical edits. Subagents inherit the session's
+  model; don't pass a model or reasoning effort to spawn_agent, since Codex cannot
+  validate either for Muse.
 - Use medium for standard implementation; high only for architecture, subtle bugs,
   security-sensitive changes, or after a lower-effort attempt failed a check.
 - Escalate one step only on evidence: failing tests or checks, or a result that does not

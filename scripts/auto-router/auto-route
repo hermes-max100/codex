@@ -69,9 +69,16 @@ while [ $# -gt 0 ]; do
     -h|--help) usage; exit 0 ;;
     --) shift; extra=("$@"); break ;;
     -*) echo "auto-route: unknown option $1" >&2; usage >&2; exit 2 ;;
-    *) task=$1; shift ;;
+    *)
+      if [ -n "$task" ]; then
+        echo "auto-route: pass exactly one task prompt (quote it); got a second: $1" >&2
+        exit 2
+      fi
+      task=$1; shift ;;
   esac
 done
+
+command -v jq >/dev/null || { echo "auto-route: jq is required" >&2; exit 2; }
 
 if [ "$stats" = 1 ]; then
   [ -f "$log" ] || { echo "auto-route: no log at $log" >&2; exit 1; }
@@ -108,11 +115,19 @@ if [ -n "$budget" ] && ! printf '%s' "$budget" | grep -Eq '^[0-9]+([.][0-9]+)?$'
   echo "auto-route: --budget-usd must be a number" >&2
   exit 2
 fi
-command -v jq >/dev/null || { echo "auto-route: jq is required" >&2; exit 2; }
 command -v "$cli" >/dev/null || { echo "auto-route: $cli not on PATH" >&2; exit 2; }
 if [ "$engine" = muse ] && [ -z "${MODEL_API_KEY:-}" ]; then
   echo "auto-route: --engine muse needs MODEL_API_KEY (create one in the Meta Model API dashboard)" >&2
   exit 2
+fi
+if [ "$cli" = codex ]; then
+  for arg in ${extra[@]+"${extra[@]}"}; do
+    case "$arg" in
+      -C|-C*|--cd|--cd=*)
+        echo "auto-route: don't pass $arg; cd into the directory first so --check runs where the agent edits" >&2
+        exit 2 ;;
+    esac
+  done
 fi
 ladder_file=${ladder_file:-$script_dir/ladder.$engine}
 [ -f "$ladder_file" ] || { echo "auto-route: ladder file $ladder_file not found" >&2; exit 2; }
@@ -120,11 +135,15 @@ ladder_file=${ladder_file:-$script_dir/ladder.$engine}
 models=()
 efforts=()
 while read -r model effort _ || [ -n "$model" ]; do
+  model=${model%$'\r'}
+  effort=${effort%$'\r'}
   case "$model" in ''|'#'*) continue ;; esac
   models+=("$model")
   efforts+=("${effort:--}")
 done < "$ladder_file"
 rungs=${#models[@]}
+# Stats group runs by this id, so editing a ladder starts a new group.
+ladder_id="$ladder_file@$(cksum < "$ladder_file" | cut -d' ' -f1)"
 [ "$max_rung" -gt 0 ] && [ "$max_rung" -lt "$rungs" ] && rungs=$max_rung
 if [ "$start" -lt 1 ] || [ "$start" -gt "$rungs" ]; then
   echo "auto-route: --start $start is outside ladder 1..$rungs" >&2
@@ -137,7 +156,8 @@ if [ -n "$budget" ] && [ "$cli" = codex ]; then
   echo "auto-route: warning: --budget-usd is not enforced for $engine (tokens are logged)" >&2
 fi
 
-mkdir -p "$(dirname "$log")"
+# Records hold task and check text, so keep the log private to its owner.
+(umask 077 && mkdir -p "$(dirname "$log")" && touch "$log")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 run_id="$(date +%s)-$$"
@@ -180,6 +200,7 @@ while [ "$rung" -le "$rungs" ]; do
     else
       agent_ok=0
       cost_known=0
+      tokens=null
     fi
   else
     args=(exec --json -o "$work/last.txt")
@@ -196,7 +217,8 @@ while [ "$rung" -le "$rungs" ]; do
     : > "$work/last.txt"
     codex "${args[@]}" ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
     message=$(cat "$work/last.txt")
-    tokens=$(jq -s '[.[] | select(.type == "turn.completed") | .usage | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' "$work/events.jsonl" 2>/dev/null || echo 0)
+    # A failed turn reports no usage, so record it as unknown (null) rather than 0.
+    tokens=$(jq -s '[.[] | select(.type == "turn.completed") | .usage | (.input_tokens // 0) + (.output_tokens // 0)] | if length == 0 then null else add end' "$work/events.jsonl" 2>/dev/null || echo null)
     grep -q '"type":"turn.failed"' "$work/events.jsonl" && agent_ok=0
   fi
   spent=$(jq -n "$spent + $cost")
@@ -212,12 +234,13 @@ while [ "$rung" -le "$rungs" ]; do
     fi
   fi
 
+  reason=${reason:0:300}
   passed=$([ -z "$reason" ] && echo true || echo false)
   # Fields are truncated so each record stays small, and the record is appended
   # with a single write so concurrent routers sharing the log don't interleave.
   record=$(jq -nc --arg run_id "$run_id" --arg engine "$engine" --argjson rung "$rung" \
-    --arg ladder "$ladder_file" --arg model "$model" --arg effort "$effort" \
-    --argjson passed "$passed" --arg reason "${reason:0:300}" --argjson cost_usd "$cost" \
+    --arg ladder "$ladder_id" --arg model "$model" --arg effort "$effort" \
+    --argjson passed "$passed" --arg reason "$reason" --argjson cost_usd "$([ "$cost_known" = 1 ] && echo "$cost" || echo null)" \
     --argjson tokens "$tokens" --arg task "${task:0:200}" \
     '{run_id: $run_id, ts: (now | floor), engine: $engine, ladder: $ladder, rung: $rung,
       model: $model, effort: $effort, passed: $passed, reason: $reason,
