@@ -86,12 +86,13 @@ if [ "$stats" = 1 ]; then
     group_by(.run_id)
     | map({ladder: "\(.[0].engine) \(.[0].ladder // "default")",
            passed: any(.[]; .passed), final: (map(.rung) | max),
-           cost: (map(.cost_usd) | add), tokens: (map(.tokens) | add)})
+           cost: (map(.cost_usd) | add), tokens: (map(.tokens) | add),
+           incomplete: any(.[]; .cost_usd == null or .tokens == null)})
     | group_by(.ladder)[]
     | . as $runs
     | "[\($runs[0].ladder)]",
       "  runs: \($runs | length)  passed: \($runs | map(select(.passed)) | length)",
-      "  total cost_usd: \($runs | map(.cost) | add)  total tokens: \($runs | map(.tokens) | add)",
+      "  total cost_usd: \($runs | map(.cost) | add)  total tokens: \($runs | map(.tokens) | add)\(if $runs | any(.incomplete) then "  (incomplete: some attempts have unknown cost or usage)" else "" end)",
       "  final rung needed (passed runs):",
       ($runs | map(select(.passed)) | group_by(.final)[]
         | "    rung \(.[0].final): \(length) runs")
@@ -111,6 +112,8 @@ for value in "$start" "$max_rung"; do
     ''|*[!0-9]*) echo "auto-route: --start/--max-rung must be non-negative integers" >&2; exit 2 ;;
   esac
 done
+start=$((10#$start))
+max_rung=$((10#$max_rung))
 if [ -n "$budget" ] && ! printf '%s' "$budget" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
   echo "auto-route: --budget-usd must be a number" >&2
   exit 2
@@ -133,7 +136,8 @@ for arg in ${extra[@]+"${extra[@]}"}; do
         exit 2
       fi ;;
     --permission-mode|--permission-mode=*|--dangerously-skip-permissions|\
-    -s|--sandbox|--sandbox=*|--full-auto|--dangerously-bypass-approvals-and-sandbox)
+    -s|--sandbox|--sandbox=*|--full-auto|--dangerously-bypass-approvals-and-sandbox|\
+    --approve-for-me|--not-so-yolo)
       caller_set_permissions=1 ;;
   esac
 done
@@ -232,16 +236,17 @@ while [ "$rung" -le "$rungs" ]; do
     args=(exec --json -o "$work/last.txt")
     if [ "$engine" = muse ]; then
       # Meta Model API speaks the OpenAI Responses API; key comes from MODEL_API_KEY.
-      args+=(-c 'model_providers.meta.name="Meta Model API"'
-        -c 'model_providers.meta.base_url="https://api.meta.ai/v1"'
-        -c 'model_providers.meta.env_key="MODEL_API_KEY"'
-        -c 'model_providers.meta.wire_api="responses"'
-        -c 'model_provider="meta"')
+      # A dedicated provider id, so settings on any existing "meta" provider don't merge in.
+      args+=(-c 'model_providers.auto_route_muse.name="Meta Model API"'
+        -c 'model_providers.auto_route_muse.base_url="https://api.meta.ai/v1"'
+        -c 'model_providers.auto_route_muse.env_key="MODEL_API_KEY"'
+        -c 'model_providers.auto_route_muse.wire_api="responses"'
+        -c 'model_provider="auto_route_muse"')
     fi
     [ "$model" != - ] && args+=(-m "$model")
     [ "$effort" != - ] && args+=(-c "model_reasoning_effort=\"$effort\"")
     : > "$work/last.txt"
-    codex "${args[@]}" ${permission_args[@]+"${permission_args[@]}"} ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
+    codex "${args[@]}" ${permission_args[@]+"${permission_args[@]}"} ${extra[@]+"${extra[@]}"} -- "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
     message=$(cat "$work/last.txt")
     # A failed turn reports no usage, so record it as unknown (null) rather than 0.
     tokens=$(jq -s '[.[] | select(.type == "turn.completed") | .usage | (.input_tokens // 0) + (.output_tokens // 0)] | if length == 0 then null else add end' "$work/events.jsonl" 2>/dev/null || echo null)
