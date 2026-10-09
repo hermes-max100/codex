@@ -1,0 +1,6 @@
+# model  effort   ("-" = CLI default). Cheapest first; each line is one escalation rung.
+haiku   -
+sonnet  medium
+opus    high
+fable   high
+fable   max

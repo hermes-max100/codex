@@ -1,0 +1,9 @@
+# model          effort   Codex CLI on a ChatGPT plan. Cheapest first.
+# Luna = fast/affordable, Terra = balanced, Sol = frontier (codex-rs/models-manager/models.json).
+# max/ultra efforts are left off on purpose; add them only for work that needs them.
+gpt-5.6-luna     low
+gpt-5.6-luna     medium
+gpt-5.6-terra    medium
+gpt-5.6-terra    high
+gpt-5.6-sol      high
+gpt-5.6-sol      xhigh

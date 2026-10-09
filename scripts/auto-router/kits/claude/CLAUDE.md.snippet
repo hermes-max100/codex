@@ -1,0 +1,11 @@
+## Model routing
+- Do small or context-heavy work directly in this session. Dispatch a subagent only for
+  broad searches, independent parallel work, or long tasks that would bloat context.
+- Route subagents to the lowest tier that fits, using the agents in .claude/agents/:
+  - `scout` (haiku): find files, read code, answer "where/what" questions. Read-only.
+  - `builder` (sonnet): implement a clearly specified change and run its tests.
+  - `architect` (opus): multi-file design, subtle bugs, security-sensitive changes.
+  Keep the top model (fable) for this main session's own judgment, not for delegated work.
+- Escalate one tier only on evidence: failing tests or checks, or a result that does not
+  hold up on review. Never report a subagent's result as done without verifying it.
+- For whole tasks run from the shell, use scripts/auto-router/auto-route --engine claude.

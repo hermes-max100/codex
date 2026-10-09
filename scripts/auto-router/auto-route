@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# auto-route: run a coding task on the cheapest model/effort rung that passes a
+# verification check, escalating one rung at a time only when the rung fails.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: auto-route [options] "task prompt" [-- extra engine args]
+       auto-route --stats [--log FILE]
+
+Runs the task on the cheapest rung of a model/effort ladder. After each rung it
+runs --check; it only escalates to the next rung if the check fails, the agent
+errors, or the agent says ROUTER_ESCALATE.
+
+Options:
+  --engine ENGINE         claude      Claude Code CLI (default)
+                          chatgpt     Codex CLI signed in with a ChatGPT plan
+                                      ("codex" is an alias)
+                          muse        Codex CLI pointed at Meta Model API
+                                      (Muse Spark); needs MODEL_API_KEY
+  --check CMD             Verification command; exit 0 = pass (e.g. "npm test").
+                          Strongly recommended: without it the only escalation
+                          signal is the agent's own self-report.
+  --start N               First rung to try (default: 1)
+  --max-rung N            Never go above rung N (default: top of ladder)
+  --budget-usd N          Stop once cumulative spend reaches N (claude only)
+  --ladder FILE           Ladder file, one "model effort" per line; "-" = default
+                          (default: ladder.<engine> next to this script)
+  --log FILE              JSONL attempt log (default: ~/.auto-router/log.jsonl)
+  --stats                 Summarize the log: which rung tasks actually needed
+
+Exit codes: 0 passed, 1 ladder exhausted, 2 usage error, 3 budget exhausted.
+EOF
+}
+
+engine=claude
+check=""
+start=1
+max_rung=0
+budget=""
+ladder_file=""
+log="${AUTO_ROUTER_LOG:-$HOME/.auto-router/log.jsonl}"
+stats=0
+task=""
+extra=()
+
+need_value() {
+  if [ "$2" -lt 2 ]; then
+    echo "auto-route: $1 requires a value" >&2
+    exit 2
+  fi
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --engine|--check|--start|--max-rung|--budget-usd|--ladder|--log) need_value "$1" $# ;;
+  esac
+  case "$1" in
+    --engine) engine=$2; shift 2 ;;
+    --check) check=$2; shift 2 ;;
+    --start) start=$2; shift 2 ;;
+    --max-rung) max_rung=$2; shift 2 ;;
+    --budget-usd) budget=$2; shift 2 ;;
+    --ladder) ladder_file=$2; shift 2 ;;
+    --log) log=$2; shift 2 ;;
+    --stats) stats=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; extra=("$@"); break ;;
+    -*) echo "auto-route: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *)
+      if [ -n "$task" ]; then
+        echo "auto-route: pass exactly one task prompt (quote it); got a second: $1" >&2
+        exit 2
+      fi
+      task=$1; shift ;;
+  esac
+done
+
+command -v jq >/dev/null || { echo "auto-route: jq is required" >&2; exit 2; }
+
+if [ "$stats" = 1 ]; then
+  [ -f "$log" ] || { echo "auto-route: no log at $log" >&2; exit 1; }
+  jq -s -r '
+    group_by(.run_id)
+    | map({ladder: "\(.[0].engine) \(.[0].ladder // "default")",
+           passed: any(.[]; .passed), final: (map(.rung) | max),
+           cost: (map(.cost_usd) | add), tokens: (map(.tokens) | add),
+           incomplete: any(.[]; .cost_usd == null or .tokens == null)})
+    | group_by(.ladder)[]
+    | . as $runs
+    | "[\($runs[0].ladder)]",
+      "  runs: \($runs | length)  passed: \($runs | map(select(.passed)) | length)",
+      "  total cost_usd: \($runs | map(.cost) | add)  total tokens: \($runs | map(.tokens) | add)\(if $runs | any(.incomplete) then "  (incomplete: some attempts have unknown cost or usage)" else "" end)",
+      "  final rung needed (passed runs):",
+      ($runs | map(select(.passed)) | group_by(.final)[]
+        | "    rung \(.[0].final): \(length) runs")
+  ' "$log"
+  exit 0
+fi
+
+case "$engine" in
+  claude|chatgpt|muse) ;;
+  codex) engine=chatgpt ;;
+  *) echo "auto-route: --engine must be claude, chatgpt, or muse" >&2; exit 2 ;;
+esac
+cli=$([ "$engine" = claude ] && echo claude || echo codex)
+[ -n "$task" ] || { usage >&2; exit 2; }
+for value in "$start" "$max_rung"; do
+  case "$value" in
+    ''|*[!0-9]*) echo "auto-route: --start/--max-rung must be non-negative integers" >&2; exit 2 ;;
+  esac
+done
+start=$((10#$start))
+max_rung=$((10#$max_rung))
+if [ -n "$budget" ] && ! printf '%s' "$budget" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+  echo "auto-route: --budget-usd must be a number" >&2
+  exit 2
+fi
+command -v "$cli" >/dev/null || { echo "auto-route: $cli not on PATH" >&2; exit 2; }
+if [ "$engine" = muse ] && [ -z "${MODEL_API_KEY:-}" ]; then
+  echo "auto-route: --engine muse needs MODEL_API_KEY (create one in the Meta Model API dashboard)" >&2
+  exit 2
+fi
+# Headless runs cannot answer permission prompts, so default to a mode that may edit
+# files in the working tree. --check runs the tests, so the agent needs no shell access.
+# An explicit permission or sandbox flag in the extra args wins.
+permission_args=()
+caller_set_permissions=0
+for arg in ${extra[@]+"${extra[@]}"}; do
+  case "$arg" in
+    -C|-C*|--cd|--cd=*)
+      if [ "$cli" = codex ]; then
+        echo "auto-route: don't pass $arg; cd into the directory first so --check runs where the agent edits" >&2
+        exit 2
+      fi ;;
+    --permission-mode|--permission-mode=*|--dangerously-skip-permissions|\
+    -s|--sandbox|--sandbox=*|--full-auto|--dangerously-bypass-approvals-and-sandbox|\
+    --approve-for-me|--not-so-yolo)
+      caller_set_permissions=1 ;;
+  esac
+done
+if [ "$caller_set_permissions" = 0 ]; then
+  if [ "$cli" = claude ]; then
+    permission_args=(--permission-mode acceptEdits)
+  else
+    permission_args=(-s workspace-write)
+  fi
+fi
+ladder_file=${ladder_file:-$script_dir/ladder.$engine}
+[ -f "$ladder_file" ] || { echo "auto-route: ladder file $ladder_file not found" >&2; exit 2; }
+
+models=()
+efforts=()
+while read -r model effort _ || [ -n "$model" ]; do
+  model=${model%$'\r'}
+  effort=${effort%$'\r'}
+  case "$model" in ''|'#'*) continue ;; esac
+  models+=("$model")
+  efforts+=("${effort:--}")
+done < "$ladder_file"
+rungs=${#models[@]}
+# Stats group runs by this id, so editing a ladder starts a new group.
+ladder_id="$ladder_file@$(cksum < "$ladder_file" | cut -d' ' -f1)"
+[ "$max_rung" -gt 0 ] && [ "$max_rung" -lt "$rungs" ] && rungs=$max_rung
+if [ "$start" -lt 1 ] || [ "$start" -gt "$rungs" ]; then
+  echo "auto-route: --start $start is outside ladder 1..$rungs" >&2
+  exit 2
+fi
+if [ -z "$check" ]; then
+  echo "auto-route: warning: no --check; escalation relies on agent self-report only" >&2
+fi
+if [ -n "$budget" ] && [ "$cli" = codex ]; then
+  echo "auto-route: warning: --budget-usd is not enforced for $engine (tokens are logged)" >&2
+fi
+
+# Records hold task and check text, so keep the log private to its owner.
+(umask 077 && mkdir -p "$(dirname "$log")" && touch "$log")
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+# Random suffix: separate hosts or containers can share a timestamp and PID.
+run_id="$(date +%s)-$$-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+spent=0
+feedback=""
+
+contract='
+
+Router contract: you are one rung of an escalation ladder. If you cannot complete
+this task correctly at your capability level, stop and print one line exactly:
+ROUTER_ESCALATE: <short reason>
+Do not guess or produce a partial fix to avoid escalating.'
+
+# Byte truncation can split a multibyte character, and Codex rejects a prompt that is
+# not valid UTF-8, so drop invalid sequences. Without iconv, fall back to ASCII.
+utf8_clean() {
+  if command -v iconv >/dev/null; then
+    iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true
+  else
+    LC_ALL=C tr -cd '\11\12\15\40-\176'
+  fi
+}
+
+rung=$start
+while [ "$rung" -le "$rungs" ]; do
+  model=${models[$((rung - 1))]}
+  effort=${efforts[$((rung - 1))]}
+  prompt="$task$contract$feedback"
+  echo "auto-route: rung $rung/$rungs model=$model effort=$effort" >&2
+
+  agent_ok=1
+  cost_known=1
+  cost=0
+  tokens=0
+  message=""
+  if [ "$engine" = claude ]; then
+    args=(-p --output-format json)
+    [ "$model" != - ] && args+=(--model "$model")
+    [ "$effort" != - ] && args+=(--effort "$effort")
+    if [ -n "$budget" ]; then
+      remaining=$(jq -n "$budget - $spent")
+      args+=(--max-budget-usd "$remaining")
+    fi
+    claude "${args[@]}" ${permission_args[@]+"${permission_args[@]}"} ${extra[@]+"${extra[@]}"} "$prompt" < /dev/null > "$work/out.json" || agent_ok=0
+    if jq -e . "$work/out.json" >/dev/null 2>&1; then
+      message=$(jq -r '.result // ""' "$work/out.json")
+      cost=$(jq -r '.total_cost_usd // 0' "$work/out.json")
+      tokens=$(jq -r '(.usage // {}) | [.input_tokens, .output_tokens, .cache_read_input_tokens, .cache_creation_input_tokens] | map(. // 0) | add' "$work/out.json")
+      [ "$(jq -r '.is_error // false' "$work/out.json")" = true ] && agent_ok=0
+    else
+      agent_ok=0
+      cost_known=0
+      tokens=null
+    fi
+  else
+    args=(exec --json -o "$work/last.txt")
+    if [ "$engine" = muse ]; then
+      # Meta Model API speaks the OpenAI Responses API; key comes from MODEL_API_KEY.
+      # A dedicated provider id, so settings on any existing "meta" provider don't merge in.
+      args+=(-c 'model_providers.auto_route_muse.name="Meta Model API"'
+        -c 'model_providers.auto_route_muse.base_url="https://api.meta.ai/v1"'
+        -c 'model_providers.auto_route_muse.env_key="MODEL_API_KEY"'
+        -c 'model_providers.auto_route_muse.wire_api="responses"'
+        -c 'model_provider="auto_route_muse"')
+    fi
+    [ "$model" != - ] && args+=(-m "$model")
+    [ "$effort" != - ] && args+=(-c "model_reasoning_effort=\"$effort\"")
+    : > "$work/last.txt"
+    codex "${args[@]}" ${permission_args[@]+"${permission_args[@]}"} ${extra[@]+"${extra[@]}"} -- "$prompt" < /dev/null > "$work/events.jsonl" || agent_ok=0
+    message=$(cat "$work/last.txt")
+    # A failed turn reports no usage, so record it as unknown (null) rather than 0.
+    tokens=$(jq -s '[.[] | select(.type == "turn.completed") | .usage | (.input_tokens // 0) + (.output_tokens // 0)] | if length == 0 then null else add end' "$work/events.jsonl" 2>/dev/null || echo null)
+    grep -q '"type":"turn.failed"' "$work/events.jsonl" && agent_ok=0
+  fi
+  spent=$(jq -n "$spent + $cost")
+
+  reason=""
+  if [ "$agent_ok" = 0 ]; then
+    reason="agent run failed"
+  elif grep -q '^ROUTER_ESCALATE:' <<< "$message"; then
+    reason=$(grep -m1 '^ROUTER_ESCALATE:' <<< "$message")
+  elif [ -n "$check" ]; then
+    # Keep only a bounded tail while streaming, so a noisy check can't fill the disk.
+    set +e
+    bash -c "$check" < /dev/null 2>&1 | tail -c 65536 > "$work/check.txt"
+    check_status=${PIPESTATUS[0]}
+    set -e
+    if [ "$check_status" != 0 ]; then
+      reason="check failed: $check"
+    fi
+  fi
+
+  reason=${reason:0:300}
+  passed=$([ -z "$reason" ] && echo true || echo false)
+  # Fields are truncated so each record stays small, and the record is appended
+  # with a single write so concurrent routers sharing the log don't interleave.
+  record=$(jq -nc --arg run_id "$run_id" --arg engine "$engine" --argjson rung "$rung" \
+    --arg ladder "$ladder_id" --arg model "$model" --arg effort "$effort" \
+    --argjson passed "$passed" --arg reason "$reason" --argjson cost_usd "$([ "$cost_known" = 1 ] && echo "$cost" || echo null)" \
+    --argjson tokens "$tokens" --arg task "${task:0:200}" \
+    '{run_id: $run_id, ts: (now | floor), engine: $engine, ladder: $ladder, rung: $rung,
+      model: $model, effort: $effort, passed: $passed, reason: $reason,
+      cost_usd: $cost_usd, tokens: $tokens, task: $task}')
+  printf '%s\n' "$record" >> "$log"
+
+  if [ "$passed" = true ]; then
+    printf '%s\n' "$message"
+    echo "auto-route: passed at rung $rung (model=$model effort=$effort, spent \$$spent)" >&2
+    exit 0
+  fi
+  echo "auto-route: rung $rung did not pass: $reason" >&2
+
+  if [ -n "$budget" ] && [ "$cost_known" = 0 ]; then
+    echo "auto-route: rung $rung's cost is unknown; stopping to protect the \$$budget budget" >&2
+    exit 3
+  fi
+  if [ -n "$budget" ] && [ "$(jq -n "$spent >= $budget")" = true ]; then
+    echo "auto-route: budget \$$budget exhausted (spent \$$spent)" >&2
+    exit 3
+  fi
+
+  # Hand the next rung a bounded summary of why this rung failed. The working
+  # tree keeps this rung's edits, so the next rung continues instead of restarting.
+  feedback="
+
+A smaller model already attempted this and did not pass ($reason).
+Its edits are still in the working tree; review them critically rather than trusting them."
+  if [ -f "$work/check.txt" ] && [ -s "$work/check.txt" ]; then
+    feedback="$feedback
+Tail of the check output (last 60 lines, capped at 4000 bytes):
+$(tail -n 60 "$work/check.txt" | tail -c 4000 | utf8_clean)"
+  fi
+  rm -f "$work/check.txt"
+  rung=$((rung + 1))
+done
+
+echo "auto-route: ladder exhausted at rung $rungs without passing (spent \$$spent)" >&2
+exit 1
